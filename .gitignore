@@ -10,3 +10,5 @@ outputs/*
 checkpoints/*.pt
 
 notebooks/videos/*.mp4
+
+demos/video_results/*
