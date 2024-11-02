@@ -106,11 +106,6 @@ def process_image(args, image_data, model):
     for ann_idx, annotation in enumerate(image_data["annotations"]):
         bbox_xywh = annotation["bbox"]
         
-        bbox_area = bbox_xywh[2] * bbox_xywh[3]
-        image_area = image.shape[0] * image.shape[1]
-        if (bbox_area / image_area) < 0.1:
-            continue
-        
         gt_mask = annotation.get("segmentation", None)
         if gt_mask is not None and len(gt_mask) > 0:
             gtm_rle = Mask.frPyObjects(gt_mask, image.shape[0], image.shape[1])
