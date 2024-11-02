@@ -45,7 +45,8 @@ def parse_args():
     # Boolean flags, default to False
     parser.add_argument("--test-keypoints", action="store_true")
     parser.add_argument("--monte-carlo-search", action="store_true")
-    parser.add_argument('--vis-by-name', action="store_true")
+    parser.add_argument('--mask-out', action="store_true")
+    parser.add_argument('--output-as-list', action="store_true")
 
     # Special flags for better pose2seg
     parser.add_argument("--expand-bbox", action="store_true", help="Expand bbox if any of the selected pose kpts is outside the bbox")
@@ -57,7 +58,7 @@ def parse_args():
     parser.add_argument('--use-bbox', action=argparse.BooleanOptionalAction)
     parser.add_argument("--debug-vis", action=argparse.BooleanOptionalAction)
     parser.add_argument("--update-bboxes", action=argparse.BooleanOptionalAction)
-    parser.add_argument('--mask-out', action=argparse.BooleanOptionalAction)
+    parser.add_argument('--vis-by-name', action=argparse.BooleanOptionalAction)
 
 
     args = parser.parse_args()
@@ -66,7 +67,7 @@ def parse_args():
     for arg in args.__dict__:
         if args.__dict__[arg] is None:
             args.__dict__[arg] = True 
-    
+
     # Check the dataset and subset
     assert args.dataset in ["COCO", "OCHuman", "OCHuman-tiny", "CrowdPose", "MPII", "AIC"]
     assert args.subset in ["train", "val", "test"]
@@ -534,7 +535,13 @@ def pose2seg(args, model, bbox_xyxy=None, pos_kpts=None, neg_kpts=None, image=No
         crop_bbox = np.array([bbox_center[0] - bbox_size[0] / 2, bbox_center[1] - bbox_size[1] / 2, bbox_center[0] + bbox_size[0] / 2, bbox_center[1] + bbox_size[1] / 2])
         crop_bbox = np.round(crop_bbox).astype(int)
         crop_bbox = np.clip(crop_bbox, 0, [image.shape[1], image.shape[0], image.shape[1], image.shape[0]])
+        original_image_size = image.shape[:2]
         image = image[crop_bbox[1]:crop_bbox[3], crop_bbox[0]:crop_bbox[2], :]
+
+        # Update the keypoints
+        kpts = kpts - crop_bbox[:2]
+        bbox[:2] = bbox[:2] - crop_bbox[:2]
+        bbox[2:] = bbox[2:] - crop_bbox[:2]
 
         model.set_image(image)
 
@@ -546,6 +553,14 @@ def pose2seg(args, model, bbox_xyxy=None, pos_kpts=None, neg_kpts=None, image=No
     )
     mask = masks[0]
 
+    if args.crop and args.use_bbox and image is not None:
+        # Pad the mask to the original image size
+        mask_padded = np.zeros(original_image_size, dtype=np.uint8)
+        mask_padded[crop_bbox[1]:crop_bbox[3], crop_bbox[0]:crop_bbox[2]] = mask
+        mask = mask_padded
+
+        bbox[:2] = bbox[:2] + crop_bbox[:2]
+        bbox[2:] = bbox[2:] + crop_bbox[:2]
 
     if args.oracle:
         dt_mask_pose_consistency = compute_mask_pose_consistency(args, mask, pos_kpts_backup, neg_kpts_backup)
@@ -1053,6 +1068,9 @@ def main(args):
         # Make unique hash describing script name and arguments
         hash_str = abs(hash(str(vars(args))+os.path.basename(__file__)))
         save_data["info"]["hash"] = hash_str
+
+        if args.output_as_list:
+            save_data = save_data["annotations"]
 
         save_data_dir = os.path.join(args.dataset_path, "sam_masks")
         os.makedirs(save_data_dir, exist_ok=True)
