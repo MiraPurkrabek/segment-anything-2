@@ -12,3 +12,6 @@ checkpoints/*.pt
 notebooks/videos/*.mp4
 
 demos/video_results/*
+
+debug*
+*.mp4

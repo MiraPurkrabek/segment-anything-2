@@ -22,7 +22,7 @@ with open("README.md", "r", encoding="utf-8") as f:
 
 # Required dependencies
 REQUIRED_PACKAGES = [
-    "torch>=2.3.0",
+    "torch>=2.1.0",
     # "torch>=2.3.1",
     "torchvision>=0.18.0",
     # "torchvision>=0.18.1",
