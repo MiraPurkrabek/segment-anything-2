@@ -15,3 +15,5 @@ demos/video_results/*
 
 debug*
 *.mp4
+*.png
+*.jpg
