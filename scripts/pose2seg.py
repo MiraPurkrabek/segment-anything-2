@@ -15,6 +15,8 @@ from pycocotools import mask as Mask
 
 import matplotlib.pyplot as plt
 
+from sam2.visualization import batch_visualize_masks
+
 DEBUG_FOLDER = "debug" 
 
 def parse_args():
@@ -47,6 +49,8 @@ def parse_args():
     assert args.subset in ["train", "val", "test"]
 
     args.dataset_path, args.subset = find_dataset_path(args.dataset, args.subset)
+
+    args.vis_by_name = True
 
     return args
 
@@ -150,6 +154,7 @@ def process_image(args, image_data, model):
 
     image_masks = []
     dt_bboxes = []
+    pos_image_kpts = []
     gt_bboxes = []
     gt_masks = []
     # for annotation in tqdm(image_data["annotations"], ascii=True):
@@ -172,11 +177,13 @@ def process_image(args, image_data, model):
             neg_kpts=other_kpts,
         )
 
-        if args.use_bbox:
-            bbox_mask = np.zeros_like(dt_mask)
-            bbox_xyxy_int = np.round(bbox_xyxy).astype(int)
-            bbox_mask[bbox_xyxy_int[1]:bbox_xyxy_int[3], bbox_xyxy_int[0]:bbox_xyxy_int[2]] = 1
-            dt_mask = np.logical_and(dt_mask, bbox_mask)
+        pos_image_kpts.append(pos_kpts)
+
+        # if args.use_bbox:
+        #     bbox_mask = np.zeros_like(dt_mask)
+        #     bbox_xyxy_int = np.round(bbox_xyxy).astype(int)
+        #     bbox_mask[bbox_xyxy_int[1]:bbox_xyxy_int[3], bbox_xyxy_int[0]:bbox_xyxy_int[2]] = 1
+        #     dt_mask = np.logical_and(dt_mask, bbox_mask)
 
         dt_mask_rle = Mask.encode(np.asfortranarray(dt_mask.astype(np.uint8)))
         image_masks.append(dt_mask_rle)
@@ -201,19 +208,55 @@ def process_image(args, image_data, model):
         # if args.debug_vis and np.random.rand() < 1.0:
         #     visualize_masks(image, dt_mask_rle, gt_mask_rle, dt_bbox, bbox_xywh, bbox_iou, mask_iou, pos_kpts=pos_kpts, neg_kpts=neg_kpts)
 
+
     if args.debug_vis and np.random.rand() < 1.0:
         gt_bboxes = np.array(gt_bboxes)
         dt_bboxes = np.array(dt_bboxes)
-        batch_visualize_masks(
-            image,
-            image_masks, 
-            None,
-            gt_bboxes,
-            dt_bboxes,
-            gt_masks,
-            bbox_ious,
-            mask_ious,
-        )
+        
+
+        filtered_gt_bboxes = []
+        filtered_dt_bboxes = []
+        filtered_gt_masks = []
+        filtered_bbox_ious = []
+        filtered_mask_ious = []
+        filtered_pos_image_kpts = []
+        filtered_image_masks = []
+        for i in range(len(image_masks)):
+            num_pos_kpts = len(pos_image_kpts[i])
+            if num_pos_kpts < args.num_pos_keypoints - 2:
+                continue
+            filtered_gt_bboxes.append(gt_bboxes[i])
+            filtered_dt_bboxes.append(dt_bboxes[i])
+            filtered_gt_masks.append(gt_masks[i])
+            filtered_bbox_ious.append(bbox_ious[i])
+            filtered_mask_ious.append(mask_ious[i])
+            filtered_pos_image_kpts.append(pos_image_kpts[i])
+            filtered_image_masks.append(image_masks[i])
+        
+        image_masks = filtered_image_masks
+        gt_bboxes = filtered_gt_bboxes
+        dt_bboxes = filtered_dt_bboxes
+        gt_masks = filtered_gt_masks
+        bbox_ious = filtered_bbox_ious
+        mask_ious = filtered_mask_ious
+        pos_image_kpts = filtered_pos_image_kpts
+
+        try:
+            batch_visualize_masks(
+                args,
+                image,
+                image_masks, 
+                pos_image_kpts,
+                gt_bboxes,
+                dt_bboxes,
+                gt_masks,
+                bbox_ious,
+                mask_ious,
+                image_path=image_path,
+            )
+        except Exception as e:
+            print(e)
+                
 
     pairwise_ious = compute_pairwise_ious(image_masks)
 
@@ -307,7 +350,7 @@ def pose2seg(args, model, bbox_xyxy=None, pos_kpts=None, neg_kpts=None):
     mask = masks[0]
     return mask, pos_kpts, neg_kpts
 
-def batch_visualize_masks(image, masks_rle, image_kpts, bboxes_xyxy, dt_bboxes, gt_masks_raw, bbox_ious, mask_ious):
+def _batch_visualize_masks(image, masks_rle, image_kpts, bboxes_xyxy, dt_bboxes, gt_masks_raw, bbox_ious, mask_ious):
     # Decode dt_masks_rle
     dt_masks = []
     for mask_rle in masks_rle:

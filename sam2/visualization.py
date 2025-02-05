@@ -7,7 +7,7 @@ from sam2.distinctipy import get_colors
 from pycocotools import mask as Mask
 
 
-def batch_visualize_masks(args, image, masks_rle, image_kpts, bboxes_xyxy, dt_bboxes, gt_masks_raw, bbox_ious, mask_ious, image_path=None, mask_out=False):
+def batch_visualize_masks(args, image, masks_rle, image_kpts, bboxes_xyxy, dt_bboxes, gt_masks_raw, bbox_ious, mask_ious, image_path=None, mask_out=False, alpha=1.0):
     # Decode dt_masks_rle
     dt_masks = []
     for mask_rle in masks_rle:
@@ -34,6 +34,7 @@ def batch_visualize_masks(args, image, masks_rle, image_kpts, bboxes_xyxy, dt_bb
         dt_mask_image = (~ dt_mask_image.astype(bool)).astype(np.uint8)
         dt_mask_image = cv2.resize(dt_mask_image, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
         dt_mask_image = image * dt_mask_image[:, :, None]
+        dt_mask_image = cv2.addWeighted(image, 1-alpha, dt_mask_image, alpha, 0)
     else:
         colors = (np.array(get_colors(dt_masks.shape[0])) * 255).astype(int)
         
@@ -48,6 +49,10 @@ def batch_visualize_masks(args, image, masks_rle, image_kpts, bboxes_xyxy, dt_bb
         # Colorize masks
         dt_masks = dt_masks * colors[:, None, None, :]
         gt_masks = gt_masks * colors[:, None, None, :]
+
+        # # Remove masks that are too small
+        # dt_masks_area = dt_masks.any(axis=3).sum(axis=(1, 2))
+        # dt_masks[dt_masks_area < 300*300] = 0
             
         # Collapse masks to 3 channels
         dt_mask_image = dt_masks.max(axis=0)
@@ -67,6 +72,7 @@ def batch_visualize_masks(args, image, masks_rle, image_kpts, bboxes_xyxy, dt_bb
         dt_mask_image = cv2.addWeighted(image, 0.6, dt_mask_image, 0.4, 0)
         # Draw contours around the masks
         for mask, color in zip(dt_masks, colors):
+
             color = color.astype(int).tolist()
 
             mask = mask.astype(np.uint8)
@@ -98,8 +104,8 @@ def batch_visualize_masks(args, image, masks_rle, image_kpts, bboxes_xyxy, dt_bb
             cv2.rectangle(gt_mask_image, (gbox[0], gbox[1]), (gbox[2], gbox[3]), color, 2)
 
             # Write IOU on th etop-left corner of the bbox
-            cv2.putText(dt_mask_image, "{:.2f}".format(biou), (dbox[0], dbox[1]-2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-            cv2.putText(gt_mask_image, "{:.2f}".format(biou), (gbox[0], gbox[1]-2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            # cv2.putText(dt_mask_image, "{:.2f}".format(biou), (dbox[0], dbox[1]-2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            # cv2.putText(gt_mask_image, "{:.2f}".format(biou), (gbox[0], gbox[1]-2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
     # Save the image
     bbox_ious = np.array(bbox_ious)
@@ -110,6 +116,9 @@ def batch_visualize_masks(args, image, masks_rle, image_kpts, bboxes_xyxy, dt_bb
         save_name = "batch_bbox_{:06.2f}_mask_{:06.2f}_{:02d}kpts_{:06d}.jpg".format(
             bbox_ious.mean(), mask_ious.mean(), args.num_pos_keypoints, np.random.randint(1000000),
         )
+
+    if 'debug_folder' not in args:
+        args.debug_folder = "debug"
 
     if mask_out:
         cv2.imwrite(os.path.join(args.debug_folder, save_name), dt_mask_image)               

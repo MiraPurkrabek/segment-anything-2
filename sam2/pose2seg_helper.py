@@ -8,13 +8,13 @@ import numpy as np
 import cv2
 import torch
 
-from sam2.build_sam import build_sam2
+from sam2.build_sam import build_sam2, build_sam2_video_predictor
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 from pycocotools import mask as Mask
 
 # Used for mask-pose consistency computation and to find the closest keypoint to the pose for negative keypoints
-STRICT_KPT_THRESHOLD = 0.9
+STRICT_KPT_THRESHOLD = 0.5
 
 def compute_pairwise_ious(masks):
     ious = []
@@ -57,6 +57,9 @@ def compute_one_mask_pose_consistency(args, mask, pos_keypoints=None, neg_keypoi
 def select_keypoints(args, kpts, num_visible, bbox=None, ignore_limbs=False, method=None, pos_kpts=None):
     "Implements different methods for selecting keypoints for pose2seg"
 
+    if num_visible == 0:
+        return kpts[:, :2], kpts[:, 2]
+
     methods = ["confidence", "distance", "distance+confidence", "closest"]
     if method is None:
         method = args.selection_method
@@ -77,26 +80,29 @@ def select_keypoints(args, kpts, num_visible, bbox=None, ignore_limbs=False, met
         facial_kpts = kpts[:3, :]
         facial_conf = kpts[:3, 2]
         facial_point = facial_kpts[np.argmax(facial_conf)]
-        if facial_point[-1] >= args.conf_thr:
+        if facial_point[-1] >= args.vis_thr:
             kpts = np.concatenate([facial_point[None, :], kpts[3:]], axis=0)
             limbs_id = limbs_id[2:]
 
     # Ignore invisible keypoints
     kpts_conf = kpts[:, 2]
-    this_kpts = kpts[kpts_conf >= args.conf_thr, :2]
+    this_kpts = kpts[kpts_conf >= args.vis_thr, :2]
     if not ignore_limbs:
-        limbs_id = limbs_id[kpts_conf >= args.conf_thr]
-    kpts_conf = kpts_conf[kpts_conf >= args.conf_thr]
+        limbs_id = limbs_id[kpts_conf >= args.vis_thr]
+    kpts_conf = kpts_conf[kpts_conf >= args.vis_thr]
 
     if method == "confidence":
 
         # Sort by confidence
-        sort_idx = np.argsort(kpts_conf[kpts_conf >= args.conf_thr])[::-1]
+        sort_idx = np.argsort(kpts_conf[kpts_conf >= args.vis_thr])[::-1]
         this_kpts = this_kpts[sort_idx, :2]
         kpts_conf = kpts_conf[sort_idx]
 
     elif method == "distance":
-        bbox_center = np.array([(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2])
+        if bbox is None:
+            bbox_center = np.array([this_kpts[:, 0].mean(), this_kpts[:, 1].mean()])
+        else:
+            bbox_center = np.array([(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2])
         dists = np.linalg.norm(this_kpts[:, :2] - bbox_center, axis=1)
         dist_matrix = np.linalg.norm(this_kpts[:, None, :2] - this_kpts[None, :, :2], axis=2)
         np.fill_diagonal(dist_matrix, np.inf)
@@ -108,7 +114,7 @@ def select_keypoints(args, kpts, num_visible, bbox=None, ignore_limbs=False, met
     elif method == "distance+confidence":
 
         # Sort by confidence
-        sort_idx = np.argsort(kpts_conf[kpts_conf >= args.conf_thr])[::-1]
+        sort_idx = np.argsort(kpts_conf[kpts_conf >= args.vis_thr])[::-1]
         confidences = kpts[sort_idx, 2]
         this_kpts = this_kpts[sort_idx, :2]
         kpts_conf = kpts_conf[sort_idx]
@@ -137,7 +143,10 @@ def select_keypoints(args, kpts, num_visible, bbox=None, ignore_limbs=False, met
         
         this_kpts = this_kpts[kpts_conf > STRICT_KPT_THRESHOLD, :]
         kpts_conf = kpts_conf[kpts_conf > STRICT_KPT_THRESHOLD]
-        bbox_center = np.array([(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2])
+        if bbox is None:
+            bbox_center = np.array([this_kpts[:, 0].mean(), this_kpts[:, 1].mean()])
+        else:
+            bbox_center = np.array([(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2])
         dists = np.linalg.norm(this_kpts[:, :2] - bbox_center, axis=1)
         sort_idx = np.argsort(dists)
         this_kpts = this_kpts[sort_idx, :2]
@@ -161,6 +170,14 @@ def find_dataset_path(dataset, subset):
         data_root = os.path.join(path_to_home, "data/OCHuman/tiny")
         subset_name = "{:s}2017".format(subset.lower())
         image_folder = os.path.join(data_root, subset_name)
+    elif dataset == "SKV":
+        data_root = os.path.join(path_to_home, "data/Floorball_SKV_data/multi-body_images/")
+        subset_name = "{:s}2017".format(subset.lower())
+        image_folder = os.path.join(data_root, subset_name)
+    elif dataset == "MMAPose":
+        data_root = os.path.join(path_to_home, "data/MMA_pose")
+        subset_name = "{:s}2017".format(subset.lower())
+        image_folder = os.path.join(data_root, subset_name)
     elif dataset == "CrowdPose":
         data_root = os.path.join(path_to_home, "data/CrowdPose")
     elif dataset == "MPII":
@@ -174,7 +191,7 @@ def find_dataset_path(dataset, subset):
 
     return data_root, image_folder, subset_name
     
-def load_data(dataset_type, dataset_path, subset, gt_file=None):
+def load_data(dataset_type, dataset_path, subset, gt_file=None, gt_is_with_vis=False):
     # Load the dataset
 
     if gt_file is not None:
@@ -182,7 +199,7 @@ def load_data(dataset_type, dataset_path, subset, gt_file=None):
         with open(gt_file, "r") as f:
             data = json.load(f)
     else:
-        if dataset_type.upper() in ["COCO", "OCHUMAN", "OCUMAN-TINY"]:
+        if dataset_type.upper() in ["COCO", "OCHUMAN", "OCUMAN-TINY", "SKV"]:
             with open(os.path.join(dataset_path, "annotations", "person_keypoints_{:s}.json".format(subset)), "r") as f:
                 data = json.load(f)
         elif dataset_type.upper() in ["MPII", "AIC"]:
@@ -220,7 +237,16 @@ def load_data(dataset_type, dataset_path, subset, gt_file=None):
                 data = mpii_data
 
         else:
-            raise ValueError("Unknown dataset type. Only COCO, OCHuman, OCHuman-tiny, MPII, AIC are supported")
+            raise ValueError("Unknown dataset type. Only COCO, OCHuman, OCHuman-tiny, MMAPose, MPII, AIC are supported")
+
+    if gt_is_with_vis:
+        for ann in data["annotations"]:
+            keypoints = np.array(ann["keypoints"]).reshape(-1, 3)
+            vis_kpts = keypoints[:, 2] == 2
+            keypoints[~vis_kpts, :] = 0
+            keypoints[vis_kpts, 2] = 1.0
+            ann["num_keypoints"] = int(vis_kpts.sum())
+            ann["keypoints"] = keypoints.astype(float).flatten().tolist()
 
     return data
 
@@ -308,6 +334,30 @@ def prepare_model(args):
     this_dir = os.path.dirname(os.path.abspath(__file__))
     sam2_checkpoint = os.path.join(this_dir, "..", "checkpoints", "sam2_hiera_base_plus.pt")
     model_cfg = "sam2_hiera_b+.yaml"
+
+    sam2 = build_sam2(model_cfg, sam2_checkpoint, device=device, apply_postprocessing=True)
+    model = SAM2ImagePredictor(
+        sam2,
+        max_hole_area=10.0,
+        max_sprinkle_area=50.0,
+    )
+    return model
+
+def prepare_video_model(sam2_checkpoint=None):
+    
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    if sam2_checkpoint is None:
+        sam2_checkpoint = os.path.join(this_dir, "..", "checkpoints", "sam2.1_hiera_base_plus.pt")
+
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    
+    model_cfg = "sam2.1_hiera_b+.yaml"
 
     sam2 = build_sam2(model_cfg, sam2_checkpoint, device=device, apply_postprocessing=True)
     model = SAM2ImagePredictor(

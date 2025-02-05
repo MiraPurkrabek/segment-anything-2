@@ -140,6 +140,7 @@ class PromptEncoder(nn.Module):
     def forward(
         self,
         points: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        skeletons: Optional[Tuple[torch.Tensor, torch.Tensor]],
         boxes: Optional[torch.Tensor],
         masks: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:

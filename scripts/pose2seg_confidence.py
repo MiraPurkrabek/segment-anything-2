@@ -36,10 +36,16 @@ def parse_args():
 
     # Number of images to process
     parser.add_argument("--conf-thr", type=float, default=0.3)
+    parser.add_argument("--vis-thr", type=float, default=0.5)
+
+    # Alpha for masking-out images
+    parser.add_argument("--mask-alpha", type=float, default=1.0)
 
     # Number of keypoints to use
     parser.add_argument("--num-pos-keypoints", type=int, default=17)
     parser.add_argument("--num-neg-keypoints", type=int, default=17)
+    parser.add_argument('--bbox-by-iou', type=float, default=None, help="IoU threshold for bbox selection. If max_iou > bbox_by_iou, bbox is not used.")
+    parser.add_argument('--num-pos-keypoints-if-bbox', type=int, default=6, help="Number of keypoints to use if bbox_by_iou is used. Does not apply if bbox_by_iou is None")
 
     parser.add_argument("--debug-folder", type=str, default="debug", help="Folder to save debug images")
     parser.add_argument("--out-filename", type=str, default="sam_masks_single")    
@@ -48,8 +54,10 @@ def parse_args():
     # Boolean flags, default to False
     parser.add_argument('--mask-out', action="store_true")
     parser.add_argument('--output-as-list', action="store_true")
+    parser.add_argument('--ignore-small-bboxes', action="store_true")
+    parser.add_argument('--GT-is-with-vis', action="store_true")
 
-    # Special flags for better pose2seg
+    # Special flags for better pose2seg. Default to False
     parser.add_argument("--expand-bbox", action="store_true", help="Expand bbox if any of the selected pose kpts is outside the bbox")
     parser.add_argument("--oracle", action="store_true", help="Evaluate dt mask compared to gt mask and take the best one")
     parser.add_argument("--crop", action="store_true", help="Crop the image to the 1.5x bbox size to increase the resolution")
@@ -70,7 +78,7 @@ def parse_args():
             args.__dict__[arg] = True 
 
     # Check the dataset and subset
-    assert args.dataset in ["COCO", "OCHuman", "OCHuman-tiny", "CrowdPose", "MPII", "AIC"]
+    assert args.dataset in ["COCO", "OCHuman", "OCHuman-tiny", "CrowdPose", "MPII", "AIC", "MMAPose", "SKV"]
     assert args.subset in ["train", "val", "test"]
 
     args.dataset_path, args.images_root, args.subset = find_dataset_path(args.dataset, args.subset)
@@ -93,9 +101,20 @@ def process_image(args, image_data, model):
     image_kpts = []
     for annotation in image_data["annotations"]:
         this_kpts = np.array(annotation["keypoints"]).reshape(-1, 3)
-        this_kpts[this_kpts[:, 2] < args.conf_thr, :2] = 0
+        kpts_vis = np.array(annotation.get("visibility", this_kpts[:, 2]))
+        conf_mask = this_kpts[:, 2] < args.conf_thr
+        this_kpts[:, 2] = kpts_vis
+        this_kpts[conf_mask, :] = 0
         image_kpts.append(this_kpts)
     image_kpts = np.array(image_kpts)
+
+    image_bboxes_xywh = [d["bbox"] for d in image_data["annotations"]]
+    image_bboxes_xyxy = [[bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3]] for bbox in image_bboxes_xywh]
+    _is_crowd = [d.get("iscrowd", 0) for d in image_data["annotations"]]
+    _max_ious = Mask.iou(image_bboxes_xywh, image_bboxes_xywh, _is_crowd)
+    _max_ious = np.array(_max_ious)
+    np.fill_diagonal(_max_ious, 0)
+    max_ious = _max_ious.max(axis=1)
 
     image_masks = []
     dt_bboxes = []
@@ -105,6 +124,10 @@ def process_image(args, image_data, model):
     pos_kpts_for_vis = []
     for ann_idx, annotation in enumerate(image_data["annotations"]):
         bbox_xywh = annotation["bbox"]
+
+        bbox_area = bbox_xywh[2] * bbox_xywh[3]
+        if args.ignore_small_bboxes and bbox_area < 100*100:
+            continue
         
         gt_mask = annotation.get("segmentation", None)
         if gt_mask is not None and len(gt_mask) > 0:
@@ -123,6 +146,12 @@ def process_image(args, image_data, model):
 
 
         if not args.ignore_SAM:
+            
+            num_pos_keypoints = args.num_pos_keypoints
+            if args.bbox_by_iou is not None and max_ious[ann_idx] > args.bbox_by_iou:
+                bbox_xyxy = None
+                num_pos_keypoints = args.num_pos_keypoints_if_bbox
+
             dt_mask, pos_kpts, neg_kpts = pose2seg(
                 args,
                 model,
@@ -130,7 +159,8 @@ def process_image(args, image_data, model):
                 pos_kpts=this_kpts,
                 neg_kpts=other_kpts,
                 image = image if (args.crop and args.use_bbox) else None,
-                gt_mask=gt_masks[-1]
+                gt_mask=gt_masks[-1],
+                num_pos_keypoints=num_pos_keypoints,
             )
             pos_kpts_for_vis.append(pos_kpts)
         else:
@@ -187,36 +217,40 @@ def process_image(args, image_data, model):
             bbox_ious,
             mask_ious,
             image_path = image_path if args.vis_by_name else None,
-            mask_out = args.mask_out
+            mask_out = args.mask_out,
+            alpha = args.mask_alpha,
         )
 
     pairwise_ious = compute_pairwise_ious(image_masks)
 
     return image_data, bbox_ious, mask_ious, pairwise_ious, [0]
 
-def pose2seg(args, model, bbox_xyxy=None, pos_kpts=None, neg_kpts=None, image=None, gt_mask=None):
+def pose2seg(args, model, bbox_xyxy=None, pos_kpts=None, neg_kpts=None, image=None, gt_mask=None, num_pos_keypoints=None):
     
+    if num_pos_keypoints is None:
+        num_pos_keypoints = args.num_pos_keypoints
+
     # Filter-out un-annotated and invisible keypoints
     if pos_kpts is not None:
         pos_kpts = pos_kpts.reshape(-1, 3)
-        valid_kpts = pos_kpts[:, 2] > args.conf_thr
-
+        valid_kpts = pos_kpts[:, 2] > args.vis_thr
+        
         pose_bbox = np.array([pos_kpts[:, 0].min(), pos_kpts[:, 1].min(), pos_kpts[:, 0].max(), pos_kpts[:, 1].max()])
         pos_kpts, conf = select_keypoints(args, pos_kpts, num_visible=valid_kpts.sum(), bbox=bbox_xyxy)
 
         pos_kpts_backup = np.concatenate([pos_kpts, conf[:, None]], axis=1)
 
-        if pos_kpts.shape[0] > args.num_pos_keypoints:
-            pos_kpts = pos_kpts[:args.num_pos_keypoints, :]
+        if pos_kpts.shape[0] > num_pos_keypoints:
+            pos_kpts = pos_kpts[:num_pos_keypoints, :]
 
     else:
         pose_bbox = None
         pos_kpts = np.empty((0, 2), dtype=np.float32)
-        pos_kpts_backup = np.empty((0, 2), dtype=np.float32)
+        pos_kpts_backup = np.empty((0, 3), dtype=np.float32)
 
     if neg_kpts is not None:
         neg_kpts = neg_kpts.reshape(-1, 3)
-        valid_kpts = neg_kpts[:, 2] > args.conf_thr
+        valid_kpts = neg_kpts[:, 2] > args.vis_thr
 
         neg_kpts, conf = select_keypoints(args, neg_kpts, num_visible=valid_kpts.sum(), bbox=bbox_xyxy, ignore_limbs=True, method="closest", pos_kpts=pos_kpts)
         selected_neg_kpts = neg_kpts
@@ -227,12 +261,11 @@ def pose2seg(args, model, bbox_xyxy=None, pos_kpts=None, neg_kpts=None, image=No
 
     else:
         selected_neg_kpts = np.empty((0, 2), dtype=np.float32)
-        neg_kpts_backup = np.empty((0, 2), dtype=np.float32)
+        neg_kpts_backup = np.empty((0, 3), dtype=np.float32)
 
     # Concatenate positive and negative keypoints
     kpts = np.concatenate([pos_kpts, selected_neg_kpts], axis=0)
     kpts_labels = np.concatenate([np.ones(pos_kpts.shape[0]), np.zeros(selected_neg_kpts.shape[0])], axis=0)
-
 
     # print(kpts.shape, kpts_labels.shape)
     # print(kpts)
@@ -245,7 +278,7 @@ def pose2seg(args, model, bbox_xyxy=None, pos_kpts=None, neg_kpts=None, image=No
     bbox = bbox_xyxy if args.use_bbox else None
     # bbox = pose_bbox if args.use_bbox else None
 
-    if (args.use_bbox and args.expand_bbox):
+    if (args.expand_bbox and not bbox is None):
         # Expand the bbox such that it contains all positive keypoints
         pose_bbox = np.array([pos_kpts[:, 0].min()-2, pos_kpts[:, 1].min()-2, pos_kpts[:, 0].max()+2, pos_kpts[:, 1].max()+2])
         expanded_bbox = np.array(bbox)
@@ -304,9 +337,11 @@ def pose2seg(args, model, bbox_xyxy=None, pos_kpts=None, neg_kpts=None, image=No
 
 def pose2seg_itterative(args, model, bbox_xyxy=None, pos_kpts=None, neg_kpts=None):
     # Filter-out un-annotated and invisible keypoints
+    raise NotImplementedError("Not updated to the new version")
+    
     if pos_kpts is not None:
         pos_kpts = pos_kpts.reshape(-1, 3)
-        valid_kpts = pos_kpts[:, 2] > args.conf_thr
+        valid_kpts = pos_kpts[:, 2] > args.vis_thr
 
         pos_kpts = select_keypoints(args, pos_kpts, num_visible=valid_kpts.sum(), bbox=bbox_xyxy)
 
@@ -318,7 +353,7 @@ def pose2seg_itterative(args, model, bbox_xyxy=None, pos_kpts=None, neg_kpts=Non
 
     if neg_kpts is not None:
         neg_kpts = neg_kpts.reshape(-1, 3)
-        valid_kpts = neg_kpts[:, 2] > args.conf_thr
+        valid_kpts = neg_kpts[:, 2] > args.vis_thr
 
         neg_kpts = select_keypoints(args, neg_kpts, num_visible=valid_kpts.sum(), bbox=bbox_xyxy, ignore_limbs=True, method="closest", pos_kpts=pos_kpts)
 
@@ -380,7 +415,7 @@ def main(args):
     args = parse_args()
 
     # Load the data from the json file
-    data = load_data(args.dataset, args.dataset_path, args.subset, args.gt_file)
+    data = load_data(args.dataset, args.dataset_path, args.subset, args.gt_file, args.GT_is_with_vis)
 
     # Parse images with annotations for image-wise processing
     parsed_data = parse_images(args, data)

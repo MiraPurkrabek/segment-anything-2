@@ -16,7 +16,7 @@ from pycocotools import mask as Mask
 from sam2.visualization import batch_visualize_masks
 from sam2.pose2seg_helper import (
     select_keypoints, compute_pairwise_ious,
-    compute_one_mask_pose_consistency, find_dataset_path,
+    compute_mask_pose_consistency, find_dataset_path,
     load_data, parse_images, unparse_images,
     prepare_model
 )
@@ -36,6 +36,10 @@ def parse_args():
 
     # Number of images to process
     parser.add_argument("--conf-thr", type=float, default=0.3)
+    parser.add_argument("--vis-thr", type=float, default=0.5)
+
+    # Alpha for masking-out images
+    parser.add_argument("--mask-alpha", type=float, default=1.0)
 
     # Number of keypoints to use
     parser.add_argument("--num-pos-keypoints", type=int, default=17)
@@ -47,6 +51,9 @@ def parse_args():
     # Boolean flags, default to False
     parser.add_argument('--mask-out', action="store_true")
     parser.add_argument('--output-as-list', action="store_true")
+    parser.add_argument('--ignore-small-bboxes', action="store_true")
+    parser.add_argument('--GT-is-with-vis', action="store_true")
+
 
     # Special flags for better pose2seg
     parser.add_argument("--expand-bbox", action="store_true", help="Expand bbox if any of the selected pose kpts is outside the bbox")
@@ -68,7 +75,7 @@ def parse_args():
             args.__dict__[arg] = True 
 
     # Check the dataset and subset
-    assert args.dataset in ["COCO", "OCHuman", "OCHuman-tiny", "CrowdPose", "MPII", "AIC"]
+    assert args.dataset in ["COCO", "OCHuman", "OCHuman-tiny", "CrowdPose", "MPII", "AIC", "SKV"]
     assert args.subset in ["train", "val", "test"]
 
     args.dataset_path, args.images_root, args.subset = find_dataset_path(args.dataset, args.subset)
@@ -92,13 +99,22 @@ def process_image(args, image_data, model):
     num_valid_kpts = []
     gt_masks = []
     for annotation in image_data["annotations"]:
+
+        bbox_xywh = annotation["bbox"]
+        bbox_area = bbox_xywh[2] * bbox_xywh[3]
+        if args.ignore_small_bboxes and bbox_area < 100*100:
+            continue
+
         this_kpts = np.array(annotation["keypoints"]).reshape(-1, 3)
-        num_visible = (this_kpts[:, 2] > args.conf_thr).sum()
+        kpts_vis = np.array(annotation.get("visibility", this_kpts[:, 2]))
+        visible_kpts = (kpts_vis > args.vis_thr) & (this_kpts[:, 2] > args.conf_thr)
+        num_visible = (visible_kpts).sum()
         if num_visible <= 0:
             continue
         num_valid_kpts.append(num_visible)
         image_bboxes.append(np.array(annotation["bbox"]))
-        this_kpts[this_kpts[:, 2] < args.conf_thr, :2] = 0
+        this_kpts[~visible_kpts, :2] = 0
+        this_kpts[:, 2] = visible_kpts
         image_kpts.append(this_kpts)
         gtm = annotation.get("segmentation", None)
         if gtm is not None and len(gtm) > 0:
@@ -146,11 +162,18 @@ def process_image(args, image_data, model):
 
         # Expand the bbox to include the positive keypoints
         if args.expand_bbox:
-            pose_bbox = np.array([np.min(image_kpts[:, :, 0])-2, np.min(image_kpts[:, :, 1])-2, np.max(image_kpts[:, :, 0])+2, np.max(image_kpts[:, :, 1])+2]).T
-            expanded_bbox = np.array(image_bboxes)
+            pose_bbox = np.stack([
+                np.min(image_kpts[:, :, 0], axis=1)-2,
+                np.min(image_kpts[:, :, 1], axis=1)-2,
+                np.max(image_kpts[:, :, 0], axis=1)+2,
+                np.max(image_kpts[:, :, 1], axis=1)+2,
+            ], axis=1)
+            expanded_bbox = np.array(image_bboxes_xyxy)
             expanded_bbox[:, :2] = np.minimum(expanded_bbox[:, :2], pose_bbox[:, :2])
             expanded_bbox[:, 2:] = np.maximum(expanded_bbox[:, 2:], pose_bbox[:, 2:])
+            # bbox_expanded = (np.abs(expanded_bbox - image_bboxes_xyxy) > 1e-4).any(axis=1)
             image_bboxes_xyxy = expanded_bbox
+            
 
     if args.ignore_SAM:
         bbox_ious = np.zeros(image_kpts.shape[0])
@@ -173,6 +196,7 @@ def process_image(args, image_data, model):
                 mask_ious,
                 image_path = image_path if args.vis_by_name else None,
                 mask_out = args.mask_out,
+                alpha = args.mask_alpha,
             )
 
     else:
@@ -189,7 +213,7 @@ def process_image(args, image_data, model):
 
         masks = masks[:, 0, :, :]
 
-        if masks.shape[0] != len(image_data["annotations"]):
+        if masks.shape[0] != len(image_kpts):
             print("Mismatch in number of masks and annotations: {:d} vs {:d}".format(masks.shape[0], len(image_data["annotations"])))
             breakpoint()
 
@@ -284,6 +308,7 @@ def process_image(args, image_data, model):
                 mask_ious,
                 image_path = image_path if args.vis_by_name else None,
                 mask_out = args.mask_out,
+                alpha = args.mask_alpha,
             )
         
         pairwise_ious = compute_pairwise_ious(image_masks)
@@ -299,7 +324,7 @@ def main(args):
     args = parse_args()
 
     # Load the data from the json file
-    data = load_data(args.dataset, args.dataset_path, args.subset, args.gt_file)
+    data = load_data(args.dataset, args.dataset_path, args.subset, args.gt_file, args.GT_is_with_vis)
 
     # Parse images with annotations for image-wise processing
     parsed_data = parse_images(args, data)
